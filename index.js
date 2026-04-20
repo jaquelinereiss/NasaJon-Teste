@@ -8,7 +8,6 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const IBGE_URL = "https://servicodados.ibge.gov.br/api/v1/localidades/municipios";
-
 function normalize(str) {
   return str
     .normalize("NFD")
@@ -21,7 +20,7 @@ async function fetchMunicipios() {
     const res = await axios.get(IBGE_URL);
     return res.data;
   } catch (err) {
-    console.error("Erro ao buscar IBGE");
+    console.error("Erro ao buscar IBGE:", err.message);
     return null;
   }
 }
@@ -29,23 +28,26 @@ async function fetchMunicipios() {
 function findBestMatch(input, municipios) {
   const normalizedInput = normalize(input);
 
-  let bestMatch = null;
-  let bestScore = 0;
+  let matches = [];
 
   municipios.forEach((m) => {
     const nome = normalize(m.nome);
     const score = stringSimilarity.compareTwoStrings(normalizedInput, nome);
 
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = m;
+    if (score > 0.7) {
+      matches.push({ municipio: m, score });
     }
   });
 
-  if (bestScore > 0.7) return bestMatch;
-  return null;
-}
+  if (matches.length === 0) return { type: "NAO_ENCONTRADO" };
 
+  matches.sort((a, b) => b.score - a.score);
+  if (matches.length > 1 && (matches[0].score - matches[1].score < 0.05)) {
+    return { type: "AMBIGUO" };
+  }
+
+  return { type: "OK", data: matches[0].municipio };
+}
 async function processar() {
   const municipiosIBGE = await fetchMunicipios();
 
@@ -66,12 +68,15 @@ async function processar() {
       .on("data", (row) => {
         stats.total_municipios++;
 
+        const populacao = Number(row.populacao);
+
+       
         if (!municipiosIBGE) {
           stats.total_erro_api++;
 
           resultados.push({
             municipio_input: row.municipio,
-            populacao_input: row.populacao,
+            populacao_input: populacao,
             municipio_ibge: "",
             uf: "",
             regiao: "",
@@ -82,14 +87,14 @@ async function processar() {
           return;
         }
 
-        const match = findBestMatch(row.municipio, municipiosIBGE);
+        const result = findBestMatch(row.municipio, municipiosIBGE);
 
-        if (!match) {
+        if (result.type === "NAO_ENCONTRADO") {
           stats.total_nao_encontrado++;
 
           resultados.push({
             municipio_input: row.municipio,
-            populacao_input: row.populacao,
+            populacao_input: populacao,
             municipio_ibge: "",
             uf: "",
             regiao: "",
@@ -100,10 +105,29 @@ async function processar() {
           return;
         }
 
+
+
+        if (result.type === "AMBIGUO") {
+          stats.total_nao_encontrado++; 
+
+          resultados.push({
+            municipio_input: row.municipio,
+            populacao_input: populacao,
+            municipio_ibge: "",
+            uf: "",
+            regiao: "",
+            id_ibge: "",
+            status: "AMBIGUO"
+          });
+
+          return;
+        }
+
+        const match = result.data;
         const regiao = match.microrregiao.mesorregiao.UF.regiao.nome;
 
         stats.total_ok++;
-        stats.pop_total_ok += Number(row.populacao);
+        stats.pop_total_ok += populacao;
 
         if (!stats.por_regiao[regiao]) {
           stats.por_regiao[regiao] = {
@@ -112,12 +136,12 @@ async function processar() {
           };
         }
 
-        stats.por_regiao[regiao].total += Number(row.populacao);
+        stats.por_regiao[regiao].total += populacao;
         stats.por_regiao[regiao].count++;
 
         resultados.push({
           municipio_input: row.municipio,
-          populacao_input: row.populacao,
+          populacao_input: populacao,
           municipio_ibge: match.nome,
           uf: match.microrregiao.mesorregiao.UF.sigla,
           regiao: regiao,
@@ -145,12 +169,17 @@ async function processar() {
 
         await gerarCSV(resultados);
 
+        console.log("JSON enviado:");
+
+        console.log(JSON.stringify({ stats: finalStats }, null, 2));
+
         await enviarStats(finalStats);
 
         resolve();
       });
   });
 }
+
 
 async function gerarCSV(data) {
   const writer = createObjectCsvWriter({
@@ -170,8 +199,12 @@ async function gerarCSV(data) {
 }
 
 async function enviarStats(stats) {
-  const url = process.env.PROJECT_FUN_URL;
+  const url = process.env.PROJECT_FUNCTION_URL;
   const token = process.env.ACCESS_TOKEN;
+
+  if (!url || !token) {
+    throw new Error("Variáveis de ambiente não definidas.");
+  }
 
   try {
     const res = await axios.post(
@@ -185,10 +218,12 @@ async function enviarStats(stats) {
       }
     );
 
-    console.log("Score:", res.data.score);
-    console.log("Feedback:", res.data.feedback);
+    console.log("Resultado da API:");
+    console.log(res.data);
+
   } catch (err) {
-    console.error("Erro ao enviar stats");
+    console.error("Erro ao enviar stats:");
+    console.error(err.response?.data || err.message);
   }
 }
 
